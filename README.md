@@ -1,4 +1,3 @@
-
 # NFT Tools
 
 Welcome to the NFT Tools project! This repository contains tools for managing and monitoring network traffic using nftables.
@@ -42,6 +41,20 @@ The `nft-blockmon.conf` file is used to configure the monitoring settings. It in
    ./nft-blockmon
    ```
 
+## 🚀 Quick Install & Uninstall
+
+**Install in one line** 🛠️:
+```sh
+curl -sSL https://raw.githubusercontent.com/Zhuul/nft-tools/main/install-nft-tools.sh \
+  | sudo bash -s install
+```
+
+**Uninstall in one line** 🧹:
+```sh
+curl -sSL https://raw.githubusercontent.com/Zhuul/nft-tools/main/install-nft-tools.sh \
+  | sudo bash -s uninstall
+```
+
 ## Contributing
 
 We welcome contributions! Please fork the repository and submit pull requests.
@@ -49,5 +62,4 @@ We welcome contributions! Please fork the repository and submit pull requests.
 ## License
 
 This project is licensed under the MIT License.
-=======
 
