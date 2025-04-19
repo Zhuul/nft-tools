@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+
+# nft-blocklist - Manage nftables blocklist
+
+# Read the installation directory from the configuration file or use the default
+CONFIG_FILE="/etc/nft-blocklist.conf"
+INSTALL_DIR="/opt/nft-blocklist"
+
+if [ -f "$CONFIG_FILE" ]; then
+    INSTALL_DIR_CONF=$(grep -E '^\s*install_dir\s*=' "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' ')
+    if [ -n "$INSTALL_DIR_CONF" ]; then
+        INSTALL_DIR="$INSTALL_DIR_CONF"
+    fi
+fi
+
+VENV_PATH="$INSTALL_DIR/venv"
+
+#   Function to display error messages
+error_exit() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+# Parse command-line arguments
+ARGS=("$@")
+for arg in "${ARGS[@]}"; do
+    case "$arg" in
+        --install)
+            INSTALL_MODE=1
+            ;;
+        --uninstall)
+            UNINSTALL_MODE=1
+            ;;
+        --help)
+            HELP_MODE=1
+            ;;
+        --debug|--verbose)
+            DEBUG_MODE=1
+            ;;
+    esac
+done
+
+# Install function
+install_script() {
+    # Create installation directory if it doesn't exist
+    if [ ! -d "$INSTALL_DIR" ]; then
+        mkdir -p "$INSTALL_DIR" || error_exit "Cannot create installation directory $INSTALL_DIR"
+    fi
+
+    # Set up virtual environment
+    if [ ! -d "$VENV_PATH" ]; then
+        python3 -m venv "$VENV_PATH" || error_exit "Failed to create virtual environment"
+    fi
+
+    # Install required packages
+    "$VENV_PATH/bin/pip" install --upgrade pip
+    "$VENV_PATH/bin/pip" install requests configparser netaddr
+
+    echo "nft-blocklist installed successfully."
+    exit 0
+}
+
+# Uninstall function
+uninstall_script() {
+    # Remove the virtual environment and installation directory
+    if [ -d "$INSTALL_DIR" ]; then
+        rm -rf "$INSTALL_DIR" || error_exit "Failed to remove installation directory $INSTALL_DIR"
+    fi
+    echo "nft-blocklist uninstalled successfully."
+    exit 0
+}
+
+# Show help function
+show_help() {
+    echo "nft-blocklist - Manage nftables blocklist"
+    echo ""
+    echo "Usage: nft-blocklist [options]"
+    echo ""
+    echo "Options:"
+    echo "  --config <path>          Path to the configuration file"
+    echo "  --flush [ipv4|ipv6|all]  Flush nft-blocklist sets"
+    echo "  --update [ipv4|ipv6|all] Update the blocklist sets"
+    echo "  --force                  Override preserve in conf file"
+    echo "  --status                 Show blocklist status"
+    echo "  --install                Install nft-blocklist"
+    echo "  --uninstall              Uninstall nft-blocklist"
+    echo "  --version                Show version information"
+    echo "  --help                   Show this help message"
+    echo "  --debug, --verbose       Enable verbose output for debugging"
+    echo "  --add-ipv4 <IPs>         Add comma-separated IPv4 addresses to the blocklist"
+    echo "  --add-ipv6 <IPs>         Add comma-separated IPv6 addresses to the blocklist"
+    echo "  --remove-ipv4 <IPs>      Remove comma-separated IPv4 addresses from the blocklist"
+    echo "  --remove-ipv6 <IPs>      Remove comma-separated IPv6 addresses from the blocklist"
+    exit 0
+}
+
+# Handle install, uninstall, and help options
+if [ "$INSTALL_MODE" == "1" ]; then
+    install_script
+elif [ "$UNINSTALL_MODE" == "1" ]; then
+    uninstall_script
+elif [ "$HELP_MODE" == "1" ]; then
+    show_help
+fi
+
+# Check if the script is installed
+if [ ! -d "$VENV_PATH" ]; then
+    error_exit "nft-blocklist is not installed. Run 'nft-blocklist --install' to install it."
+fi
+
+# Activate the virtual environment
+source "$VENV_PATH/bin/activate"
+
+# Run the Python code embedded within this script, passing all arguments
+python3 - "$@" <<'END_PYTHON'
+
+import os
+import sys
+import subprocess
+import logging
+import tempfile
+import shutil
+import re
+import requests
+import configparser
+from netaddr import IPNetwork, IPSet, AddrFormatError
+
+# Parse command-line arguments
+import argparse
+
+parser = argparse.ArgumentParser(description='Manage nftables blocklist')
+parser.add_argument('--config', type=str, default='/etc/nft-blocklist.conf', help='Path to the configuration file')
+parser.add_argument('--flush', choices=['ipv4', 'ipv6', 'all'], default=None, help='Flush nft-blocklist sets')
+parser.add_argument('--update', choices=['ipv4', 'ipv6', 'all'], default=None, help='Update the blocklist sets')
+parser.add_argument('--status', action='store_true', help='Show blocklist status')
+parser.add_argument('--version', action='version', version='nft-blocklist version 1.0', help='Show version information')
+parser.add_argument('--debug', '--verbose', action='store_true', help='Enable verbose output for debugging')
+parser.add_argument('--force', action='store_true', help='Force update, ignoring preserve settings')
+parser.add_argument('--add-ipv4', type=str, help='Add comma-separated IPv4 addresses to the blocklist')
+parser.add_argument('--add-ipv6', type=str, help='Add comma-separated IPv6 addresses to the blocklist')
+parser.add_argument('--remove-ipv4', type=str, help='Remove comma-separated IPv4 addresses from the blocklist')
+parser.add_argument('--remove-ipv6', type=str, help='Remove comma-separated IPv6 addresses from the blocklist')
+args = parser.parse_args()
+
+# Set up logging
+log_level = logging.DEBUG if args.debug else logging.INFO
+logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Check if script is run as root
+if os.geteuid() != 0:
+    logging.error("This script must be run as root.")
+    sys.exit(1)
+
+# Adjust the path to nft if necessary
+NFT = '/usr/sbin/nft'
+if not os.path.exists(NFT):
+    NFT = '/usr/bin/nft'
+
+DEFAULT_CONFIG_FILE = args.config
+
+def validate_config(config):
+    required_sections = ['GENERAL', 'URLS', 'WHITELIST', 'PRESERVE']
+    for section in required_sections:
+        if section not in config:
+            raise ValueError(f"Missing section in config: {section}")
+
+def read_config(config_path):
+    config = configparser.ConfigParser()
+    config.read(config_path)
+    validate_config(config)
+    return config
+
+def check_nft_exists():
+    if not os.path.isfile(NFT) or not os.access(NFT, os.X_OK):
+        logging.error(f"{NFT} not found or not executable.")
+        sys.exit(1)
+
+def run_nft_command(cmd):
+    """
+    Run an nft command and handle errors.
+    """
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logging.error(f"nft command failed: {result.stderr}")
+        return False
+    return True
+
+def nft_set_exists(set_name):
+    cmd = [NFT, 'list', 'set', 'inet', 'filter', set_name]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+# Functions to add/remove IPs from blocklist sets
+def modify_set(ip_version, ips, action):
+    set_name = f'blocklist_set_{ip_version}'
+    if not nft_set_exists(set_name):
+        logging.error(f"Set {set_name} does not exist. Cannot {action} elements.")
+        return
+    valid_ips = []
+    for ip in ips:
+        try:
+            network = IPNetwork(ip.strip())
+            if (ip_version == 'ipv4' and network.version != 4) or (ip_version == 'ipv6' and network.version != 6):
+                logging.error(f"IP version mismatch for {ip} (expected {ip_version})")
+                continue
+            valid_ips.append(str(network.cidr))
+        except AddrFormatError as e:
+            logging.error(f"Invalid {ip_version} address {ip}: {e}")
+            continue
+    if not valid_ips:
+        logging.warning(f"No valid {ip_version} addresses provided.")
+        return
+    elements = '{ ' + ', '.join(valid_ips) + ' }'
+    cmd = [NFT, action, 'element', 'inet', 'filter', set_name, elements]
+    if run_nft_command(cmd):
+        logging.info(f"{action.capitalize()}ed {len(valid_ips)} elements in {set_name}")
+    else:
+        logging.error(f"Failed to {action} elements in {set_name}")
+
+def process_ips(ip_arg, ip_version, action):
+    if ip_arg:
+        ips = [ip.strip() for ip in ip_arg.split(',') if ip.strip()]
+        if ips:
+            modify_set(ip_version, ips, action)
+
+def flush_nft_sets(option):
+    ip_versions = get_ip_versions(option)
+    for ip_version in ip_versions:
+        set_name = f'blocklist_set_{ip_version}'
+        if nft_set_exists(set_name):
+            cmd = [NFT, 'flush', 'set', 'inet', 'filter', set_name]
+            subprocess.run(cmd)
+            logging.info(f"Flushed nftables set {set_name}")
+        else:
+            logging.info(f"Set {set_name} does not exist, skipping flush")
+
+def get_ip_versions(option):
+    if option == 'all':
+        return ['ipv4', 'ipv6']
+    else:
+        return [option]
+
+def update_and_apply(option, config):
+    ip_versions = get_ip_versions(option)
+    for ip_version in ip_versions:
+        update_blocklist(
+            ip_version,
+            config.get('URLS', f'ipv4' if ip_version == 'ipv4' else 'ipv6', fallback='').split(','),
+            config.get('FILES', f'ipv4' if ip_version == 'ipv4' else 'ipv6', fallback='').split(','),
+            config.get('WHITELIST', f'ipv4' if ip_version == 'ipv4' else 'ipv6', fallback='').split(','),
+            config.getboolean('PRESERVE', f'ipv4' if ip_version == 'ipv4' else 'ipv6', fallback=False)
+        )
+        apply_nft_rules(ip_version, config)  # Pass config here
+
+def update_blocklist(ip_version, urls, files, whitelist, preserve):
+    set_name = f'blocklist_set_{ip_version}'
+    nft_type = 'ipv4_addr' if ip_version == 'ipv4' else 'ipv6_addr'
+
+    # Filter out empty strings from URLs and files
+    urls = [url.strip() for url in urls if url.strip()]
+    files = [file.strip() for file in files if file.strip()]
+
+    # Skip if no URLs or files are provided
+    if not urls and not files:
+        logging.warning(f"No valid URLs or files provided for {ip_version}. Skipping update.")
+        return
+
+    # Download and combine sources
+    blocklist_file = download_blocklists(urls, ip_version)
+    local_file = read_local_files(files)
+    combined_file = combine_files([blocklist_file, local_file])
+    ip_list = parse_ip_addresses(combined_file, ip_version)
+    ip_set = set(ip_list)  # Remove duplicates
+
+    logging.info(f"Found {len(ip_set)} total entries before whitelist.")
+
+    # Remove whitelisted items
+    try:
+        ipset_obj = IPSet([IPNetwork(ip) for ip in ip_set])
+        for w_ip in whitelist:
+            try:
+                ipset_obj.remove(IPNetwork(w_ip))
+                logging.info(f"Whitelisted {w_ip} removed.")
+            except:
+                logging.debug(f"{w_ip} not found or not removable.")
+    except Exception as e:
+        logging.error(f"Error while removing whitelist: {e}")
+        return
+
+    # Preserve existing entries (if not forced)
+    if not args.force and preserve and nft_set_exists(set_name):
+        try:
+            existing_ips = get_existing_set_elements(set_name)
+            ipset_obj.update(IPSet([IPNetwork(ip) for ip in existing_ips]))
+            logging.info(f"Preserved {len(existing_ips)} entries in {set_name}.")
+        except Exception as e:
+            logging.error(f"Error preserving existing set: {e}")
+            return
+
+    # Convert IPSet to list of CIDRs
+    try:
+        merged_ip_list = [str(cidr) for cidr in ipset_obj.iter_cidrs()]
+    except Exception as e:
+        logging.error(f"Error creating merged IP list: {e}")
+        return
+
+    # Build nftables config
+    nft_config = (
+        f"set inet filter {set_name} {{\n"
+        f"    type {nft_type};\n"
+        f"    flags interval;\n"
+        f"    elements = {{\n"
+        + ",\n".join(f"        {ip}" for ip in merged_ip_list)
+        + "\n    }\n}\n"
+    )
+
+    # Write and load nftables config
+    with tempfile.NamedTemporaryFile('w', delete=False) as nft_file:
+        nft_file.write(nft_config)
+        nft_file_path = nft_file.name
+
+    if not run_nft_command([NFT, '-f', nft_file_path]):
+        logging.error(f"Failed to load nftables config for {set_name}.")
+    else:
+        logging.info(f"Loaded {set_name} with {len(merged_ip_list)} entries.")
+
+    # Clean up
+    for temp_file in [blocklist_file, local_file, combined_file, nft_file_path]:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+def apply_nft_rules(ip_version, config):
+    set_name = f'blocklist_set_{ip_version}'
+    protocol = 'ip6' if ip_version == 'ipv6' else 'ip'
+    
+    for chain in ['input', 'forward', 'output']:
+        if config.getboolean('CHAINS', chain, fallback=False):
+            # Determine match criteria based on chain
+            if chain == 'output':
+                match = f'{protocol} daddr @{set_name}'
+                rule_spec = f'{match} log prefix "Blocked-out {ip_version}: " counter drop'
+            else:
+                match = f'{protocol} saddr @{set_name}'
+                rule_spec = f'{match} log prefix "Blocked-in {ip_version}: " counter drop'
+
+            if not nft_rule_exists(chain, match, set_name):
+                cmd = [NFT, 'add', 'rule', 'inet', 'filter', chain, match, 
+                       'log', 'prefix', f'"Blocked {ip_version}: "', 'counter', 'drop']
+                if run_nft_command(cmd):
+                    logging.info(f"Added rule to {chain} chain: {rule_spec}")
+                else:
+                    logging.error(f"Failed to add rule to {chain} chain")
+            else:
+                logging.info(f"Rule already exists in {chain} chain: {rule_spec}")
+
+def nft_rule_exists(chain, protocol, set_name):
+    cmd = [NFT, 'list', 'chain', 'inet', 'filter', chain]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return False
+    lines = result.stdout.splitlines()
+    for line in lines:
+        if f'{protocol} saddr @{set_name}' in line:
+            return True
+    return False
+
+def download_blocklists(urls, ip_version):
+    temp_file = tempfile.NamedTemporaryFile(delete=False, mode='w')
+    for url in urls:
+        logging.info(f"Downloading {url}")
+        try:
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            content = re.sub(r'[;#].*$', '', response.text, flags=re.MULTILINE)
+            temp_file.write(content + '\n')
+        except requests.RequestException as e:
+            logging.error(f"Failed to download {url}: {e}")
+    temp_file.close()
+    return temp_file.name
+
+def read_local_files(file_paths):
+    temp_file = tempfile.NamedTemporaryFile(delete=False, mode='w')
+    for file_path in file_paths:
+        if os.path.exists(file_path):
+            logging.info(f"Reading local file {file_path}")
+            with open(file_path, 'r') as f:
+                temp_file.write(f.read())
+        else:
+            logging.warning(f"Local file {file_path} not found")
+    temp_file.close()
+    return temp_file.name
+
+def parse_ip_addresses(file_path, ip_version):
+    valid_ips = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            ip = line.strip()
+            if not ip:
+                continue
+            ip = ip.split('#')[0].split(';')[0].strip()
+            if not ip:
+                continue
+            try:
+                network = IPNetwork(ip)
+                if (ip_version == 'ipv4' and network.version == 4) or \
+                   (ip_version == 'ipv6' and network.version == 6):
+                    valid_ips.append(str(network))
+                    logging.debug(f"Parsed IP: {ip}")
+                else:
+                    logging.debug(f"IP version mismatch, skipped: {ip}")
+            except AddrFormatError:
+                logging.debug(f"Invalid IP address skipped: {ip}")
+    return valid_ips
+
+def combine_files(file_paths):
+    combined_file = tempfile.NamedTemporaryFile(delete=False, mode='w')
+    for file_path in file_paths:
+        if file_path and os.path.exists(file_path):
+            with open(file_path, 'r') as f_in:
+                shutil.copyfileobj(f_in, combined_file)
+    combined_file.close()
+    return combined_file.name
+
+def get_existing_set_elements(set_name):
+    cmd = [NFT, 'list', 'set', 'inet', 'filter', set_name]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    elements = []
+    if result.returncode == 0:
+        # Extract elements from the output
+        matches = re.findall(r'elements = {([^}]*)}', result.stdout, re.DOTALL)
+        if matches:
+            elements_text = matches[0]
+            elements_list = re.split(r',\s*', elements_text.strip())
+            elements = [elem.strip() for elem in elements_list if elem.strip()]
+    return elements
+
+def show_status():
+    for ip_version in ['ipv4', 'ipv6']:
+        set_name = f'blocklist_set_{ip_version}'
+        if nft_set_exists(set_name):
+            # Get the number of elements in the set
+            cmd = [NFT, 'list', 'set', 'inet', 'filter', set_name]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                matches = re.findall(r'elements = {([^}]*)}', result.stdout, re.DOTALL)
+                if matches:
+                    elements_text = matches[0]
+                    elements_list = re.split(r',\s*', elements_text.strip())
+                    count = len([elem for elem in elements_list if elem.strip()])
+                    logging.info(f"Blocklist {set_name} is active with {count} entries.")
+                else:
+                    logging.info(f"Blocklist {set_name} is active but contains no entries.")
+            else:
+                logging.error(f"Failed to list set {set_name}: {result.stderr}")
+        else:
+            logging.info(f"Blocklist {set_name} is not active.")
+
+def main():
+    config = read_config(DEFAULT_CONFIG_FILE)
+    check_nft_exists()
+
+    if args.status:
+        show_status()
+        sys.exit(0)
+
+    if args.flush:
+        flush_nft_sets(args.flush)
+
+    if args.update:
+        update_and_apply(args.update, config)
+
+    # Handle manual add/remove of IPv4/IPv6 addresses
+    process_ips(args.add_ipv4, 'ipv4', 'add')
+    process_ips(args.add_ipv6, 'ipv6', 'add')
+    process_ips(args.remove_ipv4, 'ipv4', 'delete')
+    process_ips(args.remove_ipv6, 'ipv6', 'delete')
+
+    logging.info("Operation completed successfully.")
+
+if __name__ == '__main__':
+    main()
+
+END_PYTHON

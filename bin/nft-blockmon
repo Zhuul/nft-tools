@@ -1,0 +1,927 @@
+#!/usr/bin/env bash
+#
+# nft-blockmon - Real-time nftables monitoring & blocking
+# Features:
+# - Live domain/IP monitoring with DNS and reverse DNS lookups
+# - Country blocking
+# - Enhanced DDoS protection with dynamic rate limiting
+# - Support for input, output, and forward chains
+
+CONFIG_FILE="/etc/nft-blockmon.conf"
+INSTALL_DIR="/opt/nft-blockmon"
+VENV_PATH="$INSTALL_DIR/venv"
+
+error_exit() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+ARGS=("$@")
+for arg in "${ARGS[@]}"; do
+    case "$arg" in
+        --install)
+            INSTALL_MODE=1
+            ;;
+        --uninstall)
+            UNINSTALL_MODE=1
+            ;;
+        --helpme)
+            HELP_MODE=1
+            ;;
+        --debug|--verbose)
+            DEBUG_MODE=1
+            ;;
+        --status)
+            STATUS_MODE=1
+            ;;
+    esac
+done
+
+install_script() {
+    echo "Installing nft-blockmon..."
+    [ -d "$INSTALL_DIR" ] || mkdir -p "$INSTALL_DIR" || error_exit "Cannot create $INSTALL_DIR"
+    if [ ! -d "$VENV_PATH" ]; then
+        python3 -m venv "$VENV_PATH" || error_exit "Failed to create virtual environment"
+    fi
+    "$VENV_PATH/bin/pip" install --upgrade pip
+    "$VENV_PATH/bin/pip" install aiodns configparser netaddr requests
+    echo "nft-blockmon installed successfully."
+    exit 0
+}
+
+uninstall_script() {
+    echo "Uninstalling nft-blockmon..."
+    [ -d "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
+    echo "Done."
+    exit 0
+}
+
+show_help() {
+    echo "nft-blockmon - Real-time nftables monitoring & blocking"
+    echo ""
+    echo "Usage: nft-blockmon [OPTIONS]"
+    echo "Options:"
+    echo "  --install               Install nft-blockmon"
+    echo "  --uninstall            Uninstall nft-blockmon"
+    echo "  --status               Show current blocking status"
+    echo "  --debug, --verbose     Enable diagnostic output"
+    echo "  --helpme               Show this help message"
+    exit 0
+}
+
+if [ "$INSTALL_MODE" == "1" ]; then
+    install_script
+elif [ "$UNINSTALL_MODE" == "1" ]; then
+    uninstall_script
+elif [ "$HELP_MODE" == "1" ]; then
+    show_help
+fi
+
+if [ ! -d "$VENV_PATH" ]; then
+    error_exit "nft-blockmon is not installed. Run 'nft-blockmon --install' first."
+fi
+
+source "$VENV_PATH/bin/activate"
+
+# Python core starts here
+python3 - "$@" <<'END_PYTHON'
+import sys
+import os
+import argparse
+import asyncio
+import socket
+import signal
+import logging
+import configparser
+import subprocess
+import traceback
+import time
+from functools import lru_cache
+from datetime import datetime, timedelta
+from collections import defaultdict
+from netaddr import IPAddress, IPNetwork, IPSet, AddrFormatError
+
+try:
+    import aiodns
+except ImportError:
+    print("Please install aiodns in the venv.")
+    sys.exit(1)
+
+VERSION = "1.0"
+CONFIG_PATH = "/etc/nft-blockmon.conf"
+NFT = '/usr/sbin/nft'
+
+# Global state
+CONFIG = {}
+LOG = None
+DEBUG_MODE = False
+CONN_TRACKER = defaultdict(lambda: defaultdict(int))
+LAST_CLEANUP = datetime.now()
+
+ipv6_failed_domains = set()
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="nft-blockmon - Real-time nftables monitor")
+    parser.add_argument("--install", action="store_true")
+    parser.add_argument("--uninstall", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--helpme", action="store_true")
+    return parser.parse_args()
+
+def setup_logging():
+    """Initialize logging configuration."""
+    level = logging.DEBUG if DEBUG_MODE else logging.INFO
+    log_format = "%(asctime)s [%(levelname)s] %(message)s"
+
+    # Setup file logging
+    logging.basicConfig(
+        filename=CONFIG.get('log_file', '/var/log/nft-blockmon.log'),
+        level=level,
+        format=log_format
+    )
+
+    # Add console handler if debug enabled
+    if DEBUG_MODE:
+        console = logging.StreamHandler()
+        console.setLevel(level)
+        console.setFormatter(logging.Formatter(log_format))
+        logging.getLogger('').addHandler(console)
+
+    return logging.getLogger('nft-blockmon')
+
+def load_config(path=CONFIG_PATH):
+    """Load and parse configuration file."""
+    cfg = configparser.ConfigParser()
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Config file not found at {path}")
+
+    cfg.read(path)
+    config = {}
+
+    # General settings
+    if 'General' in cfg:
+        config['log_file'] = cfg['General'].get('log_file', '/var/log/nft-blockmon.log')
+        config['debug'] = cfg['General'].getboolean('debug', False)
+
+    # DDoS settings
+    if 'DDOS' in cfg:
+        config['ddos'] = {
+            'interfaces': [x.strip() for x in cfg['DDOS'].get('interfaces', '').split(',') if x.strip()],
+            'tcp_ports': [int(x) for x in cfg['DDOS'].get('tcp_ports', '').split(',') if x.strip()],
+            'udp_ports': [int(x) for x in cfg['DDOS'].get('udp_ports', '').split(',') if x.strip()],
+            'tcp_rate': cfg['DDOS'].getint('tcp_rate', 100),
+            'tcp_burst': cfg['DDOS'].getint('tcp_burst', 200),
+            'udp_rate': cfg['DDOS'].getint('udp_rate', 50),
+            'udp_burst': cfg['DDOS'].getint('udp_burst', 100),
+            'block_time': cfg['DDOS'].getint('block_time', 3600)
+        }
+
+    # Whitelist settings
+    if 'Whitelist' in cfg:
+        config['whitelist'] = {
+            'ips': [x.strip() for x in cfg['Whitelist'].get('ips', '').split(',') if x.strip()],
+            'domains': [x.strip() for x in cfg['Whitelist'].get('domains', '').split(',') if x.strip()]
+        }
+
+    # Blacklist settings
+    if 'Blacklist' in cfg:
+        config['blacklist'] = {
+            'countries': [x.strip().upper() for x in cfg['Blacklist'].get('countries', '').split(',') if x.strip()],
+            'domains': [x.strip() for x in cfg['Blacklist'].get('domains', '').split(',') if x.strip()],
+            'direction': cfg['Blacklist'].get('direction', 'inbound').lower()
+        }
+
+    return config
+
+def run_nft(args, capture_output=False, stdin_data=None):
+    """Execute nft command safely with optional input."""
+    cmd = [NFT] + args
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=capture_output,
+            text=True,
+            input=stdin_data,
+            check=True
+        )
+        return result.stdout if capture_output else None
+    except subprocess.CalledProcessError as e:
+        LOG.error(f"nft command failed: {e}")
+        if capture_output:
+            LOG.error(f"stderr: {e.stderr}")
+        return None
+
+def ensure_table():
+    """Create inet filter table if missing."""
+    try:
+        run_nft(['list', 'table', 'inet', 'filter'], capture_output=True)
+    except:
+        run_nft(['add', 'table', 'inet', 'filter'])
+        LOG.info("Created table inet filter")
+
+def ensure_chains():
+    """Create chains with proper nftables syntax."""
+    ensure_table()
+
+    # Base chains
+    base_chains = (
+        "add chain inet filter input { type filter hook input priority 0; policy accept; }",
+        "add chain inet filter forward { type filter hook forward priority 0; policy accept; }",
+        "add chain inet filter output { type filter hook output priority 0; policy accept; }"
+    )
+
+    # DDoS chains
+    ddos_chains = (
+        "add chain inet filter ddos_tcp { type filter hook input priority -1; }",
+        "add chain inet filter ddos_udp { type filter hook input priority -1; }"
+    )
+
+    # Create chains using nft -f
+    for chain_cmd in base_chains + ddos_chains:
+        try:
+            run_nft(['-f', '-'], stdin_data=chain_cmd)
+        except Exception as e:
+            if 'File exists' not in str(e):
+                LOG.error(f"Failed to create chain: {e}")
+
+def ensure_blockmon_sets():
+    """Create required nftables sets for inbound and outbound (both IPv4 and IPv6)."""
+    ensure_table()
+    sets = {
+        'blockmon4': 'ipv4_addr',
+        'blockmon6': 'ipv6_addr',
+        'blockmon4_out': 'ipv4_addr',
+        'blockmon6_out': 'ipv6_addr',
+        'ddos_tcp4': 'ipv4_addr',
+        'ddos_tcp6': 'ipv6_addr',
+        'ddos_udp4': 'ipv4_addr',
+        'ddos_udp6': 'ipv6_addr'
+    }
+    for set_name, addr_type in sets.items():
+        cmd = f"""
+        add set inet filter {set_name} {{
+            type {addr_type};
+            flags interval;
+            size 65535;
+        }}
+        """
+        try:
+            run_nft(['-f', '-'], stdin_data=cmd.strip())
+            LOG.info(f"Created set {set_name}")
+        except Exception as e:
+            if 'File exists' not in str(e):
+                LOG.error(f"Failed to create set {set_name}: {e}")
+
+def add_base_rules():
+    """Add nftables rules for inbound/outbound blocking."""
+    rules = [
+        # Inbound
+        "add rule inet filter input ip saddr @blockmon4 drop",
+        "add rule inet filter input ip6 saddr @blockmon6 drop",
+        # Outbound
+        "add rule inet filter output ip daddr @blockmon4_out drop",
+        "add rule inet filter output ip6 daddr @blockmon6_out drop",
+        # Forward
+        "add rule inet filter forward ip saddr @blockmon4 drop",
+        "add rule inet filter forward ip6 saddr @blockmon6 drop",
+        "add rule inet filter forward ip daddr @blockmon4_out drop",
+        "add rule inet filter forward ip6 daddr @blockmon6_out drop",
+        # ICMP (corrected syntax)
+        "add rule inet filter input icmp type echo-request ip saddr @blockmon4 drop",
+        "add rule inet filter output icmp type echo-reply ip daddr @blockmon4_out drop",
+        "add rule inet filter forward icmp type echo-request ip saddr @blockmon4 drop",
+        "add rule inet filter forward icmp type echo-reply ip daddr @blockmon4_out drop",
+        # ICMPv6 (corrected syntax)
+        "add rule inet filter input icmpv6 type echo-request ip6 saddr @blockmon6 drop",
+        "add rule inet filter output icmpv6 type echo-reply ip6 daddr @blockmon6_out drop",
+        "add rule inet filter forward icmpv6 type echo-request ip6 saddr @blockmon6 drop",
+        "add rule inet filter forward icmpv6 type echo-reply ip6 daddr @blockmon6_out drop",
+        # DDoS logic
+        "add rule inet filter ddos_tcp tcp flags & (fin|syn) == syn counter",
+        "add rule inet filter ddos_tcp tcp flags & (fin|syn) == syn ip saddr @ddos_tcp4 drop",
+        "add rule inet filter ddos_tcp tcp flags & (fin|syn) == syn ip6 saddr @ddos_tcp6 drop",
+        "add rule inet filter ddos_udp ip saddr @ddos_udp4 counter drop",
+        "add rule inet filter ddos_udp ip6 saddr @ddos_udp6 counter drop"
+    ]
+    for rule in rules:
+        try:
+            run_nft(['-f', '-'], stdin_data=rule)
+            LOG.info(f"Added rule: {rule}")
+        except Exception as e:
+            if 'File exists' in str(e):
+                LOG.debug(f"Rule already exists: {rule}")
+            else:
+                LOG.error(f"Failed to add rule {rule}: {e}")
+
+
+def cleanup():
+    """Clean up nftables sets and rules."""
+    try:
+        # Remove rules referencing sets first
+        existing_chains = run_nft(['list', 'chains'], capture_output=True)
+        if 'ddos_tcp' in existing_chains:
+            run_nft(['-f', '-'], stdin_data="flush chain inet filter ddos_tcp")
+        if 'ddos_udp' in existing_chains:
+            run_nft(['-f', '-'], stdin_data="flush chain inet filter ddos_udp")
+
+        # Then remove the sets
+        existing_sets = run_nft(['list', 'sets'], capture_output=True)
+        sets = ['ddos_tcp4', 'ddos_tcp6', 'ddos_udp4', 'ddos_udp6']
+        for set_name in sets:
+            if set_name in existing_sets:
+                run_nft(['-f', '-'], stdin_data=f"delete set inet filter {set_name}")
+
+        # Finally remove chains
+        chains = ['ddos_tcp', 'ddos_udp']
+        for chain in chains:
+            if chain in existing_chains:
+                run_nft(['-f', '-'], stdin_data=f"delete chain inet filter {chain}")
+
+    except Exception as e:
+        LOG.error(f"Cleanup error: {e}")
+
+
+async def block_ip(ip_str, reason='manual', direction='inbound'):
+    """Add IP to inbound or outbound block sets."""
+    from netaddr import IPAddress, AddrFormatError
+    try:
+        ip_obj = IPAddress(ip_str)
+        # Determine nftables set name
+        if ip_obj.version == 4:
+            set_name = 'blockmon4_out' if direction == 'outbound' else 'blockmon4'
+        else:
+            set_name = 'blockmon6_out' if direction == 'outbound' else 'blockmon6'
+
+        cmd = [
+            '-f', '-'
+        ]
+        nft_instructions = f"add element inet filter {set_name} {{ {ip_str} }}"
+        run_nft(cmd, stdin_data=nft_instructions)
+        LOG.info(f"Blocked {ip_str} ({direction}). Reason: {reason}")
+    except AddrFormatError:
+        LOG.error(f"Invalid IP address: {ip_str}")
+
+# Add DNS caching and reverse lookup
+@lru_cache(maxsize=1024)
+async def resolve_domain(domain, timeout=5):
+    """Resolve domain to IPv4/IPv6 addresses with caching and timeout."""
+    results = set()
+    try:
+        resolver = aiodns.DNSResolver()
+
+        # Try IPv4
+        try:
+            resp = await asyncio.wait_for(resolver.query(domain, 'A'), timeout)
+            results.update(r.host for r in resp)
+        except asyncio.TimeoutError:
+            LOG.debug(f"IPv4 lookup timed out for {domain}")
+        except Exception as e:
+            LOG.debug(f"IPv4 lookup failed for {domain}: {e}")
+
+        # Try IPv6 only if not already failed
+        if not hasattr(resolve_domain, f'ipv6_failed_{domain}'):
+            try:
+                resp = await asyncio.wait_for(resolver.query(domain, 'AAAA'), timeout)
+                results.update(r.host for r in resp)
+            except asyncio.TimeoutError:
+                LOG.debug(f"IPv6 lookup timed out for {domain}")
+            except Exception as e:
+                LOG.debug(f"IPv6 lookup failed for {domain}: {e}")
+                # Mark domain as IPv6 failed
+                setattr(resolve_domain, f'ipv6_failed_{domain}', True)
+
+    except Exception as e:
+        LOG.error(f"Failed to resolve {domain}: {e}")
+
+    return results
+
+def reverse_dns_lookup(ip):
+    """Reverse DNS lookup with caching and TTL."""
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except:
+        return None
+
+# Custom TTL cache (simple example)
+class CustomCache:
+    def __init__(self, ttl=3600):
+        self.cache = {}
+        self.ttl = ttl
+
+    def get(self, key):
+        data = self.cache.get(key)
+        if data and time.time() < data['expires']:
+            return data['value']
+        self.cache.pop(key, None)
+        return None
+
+    def set(self, key, value):
+        self.cache[key] = {
+            'value': value,
+            'expires': time.time() + self.ttl
+        }
+
+
+
+dns_cache = CustomCache()
+
+@lru_cache(maxsize=1024)  # No TTL param here
+def reverse_dns_lookup(ip):
+    cached = dns_cache.get(ip)
+    if cached:
+        return cached
+    try:
+        hostname = socket.gethostbyaddr(ip)[0]
+        dns_cache.set(ip, hostname)
+        return hostname
+    except:
+        return None
+
+async def resolve_domain(domain):
+    """Resolve domain to IPv4/IPv6 addresses with caching and fallback."""
+    cached = dns_cache.get(domain)
+    if cached is not None:
+        return cached
+
+    results = set()
+    try:
+        resolver = aiodns.DNSResolver()
+        # Attempt IPv4 resolution
+        try:
+            resp_a = await resolver.query(domain, 'A')
+            results.update(r.host for r in resp_a)
+        except Exception as e:
+            LOG.debug(f"IPv4 lookup failed for {domain}: {e}")
+
+        # Attempt IPv6 resolution if not previously failed
+        if domain not in ipv6_failed_domains:
+            try:
+                resp_aaaa = await resolver.query(domain, 'AAAA')
+                results.update(r.host for r in resp_aaaa)
+            except Exception as e:
+                LOG.debug(f"IPv6 lookup failed for {domain}: {e}")
+                ipv6_failed_domains.add(domain)
+    except Exception as e:
+        LOG.error(f"Failed to resolve {domain}: {e}")
+
+    dns_cache.set(domain, results)
+    return results
+
+class ConnectionStats:
+    def __init__(self):
+        self.connections = {
+            'tcp': {'total': 0},
+            'udp': {'total': 0},
+        }
+        self.blocks = {}
+        self.started = datetime.now()
+        self.peak_rates = {
+            'tcp': 0,
+            'udp': 0
+        }
+
+    def update_connection(self, proto, iface, src_ip):
+        self.connections[proto]['total'] += 1
+        if iface not in self.connections[proto]:
+            self.connections[proto][iface] = 0
+        self.connections[proto][iface] += 1
+
+    def record_block(self, ip, reason, proto='unknown'):
+        if reason not in self.blocks:
+            self.blocks[reason] = []
+        self.blocks[reason].append((ip, proto))
+
+    def get_report(self):
+        uptime_sec = int((datetime.now() - self.started).total_seconds())
+        return {
+            'uptime_seconds': uptime_sec,
+            'connections': self.connections,
+            'blocks': self.blocks,
+            'peak_rates': self.peak_rates
+        }
+
+class ConnectionTracker:
+    """Track and analyze network connections."""
+
+    def __init__(self, config):
+        self.config = config
+        # Track connections per proto/iface/ip
+        self.connections = defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(
+                    lambda: {
+                        'count': 0,
+                        'first_seen': datetime.now(),
+                        'last_seen': datetime.now()
+                    }
+                )
+            )
+        )
+        self.last_cleanup = datetime.now()
+        self.known_ips = set()
+        self.blocked = set()
+        self.stats = defaultdict(int)
+
+    def cleanup(self):
+        """Remove old entries periodically."""
+        now = datetime.now()
+        if (now - self.last_cleanup).seconds > 60:
+            # Clear old connection data
+            for proto in self.connections:
+                for iface in self.connections[proto]:
+                    stale = []
+                    for ip, data in self.connections[proto][iface].items():
+                        if (now - data['last_seen']).seconds > 60:
+                            stale.append(ip)
+                    for ip in stale:
+                        del self.connections[proto][iface][ip]
+
+            self.last_cleanup = now
+            LOG.debug(f"Cleaned up connection tracking data")
+
+    async def check_ip(self, ip, iface, proto, port=None, direction='inbound'):
+        """Check IP against rules and update tracking."""
+        try:
+            # Skip already blocked IPs
+            if ip in self.blocked:
+                return None, None
+
+            # Skip whitelisted IPs
+            if ip in self.config.get('whitelist_ips', []):
+                return None, None
+
+            # Check new IP against blacklists
+            if ip not in self.known_ips:
+                self.known_ips.add(ip)
+                self.stats['total_unique_ips'] += 1
+
+                # Check reverse DNS
+                hostname = reverse_dns_lookup(ip)
+                if hostname:
+                    for domain in self.config.get('blacklist_domains', []):
+                        if domain.lower() in hostname.lower():
+                            self.stats['dns_blocks'] += 1
+                            return ip, f"blacklisted domain match: {hostname}"
+
+            # Update connection tracking
+            conn_data = self.connections[proto][iface][ip]
+            conn_data['count'] += 1
+            conn_data['last_seen'] = datetime.now()
+
+            # Check DDoS thresholds
+            for rule in self.config.get('ddos_rules', []):
+                if (port in rule[f'{proto}_ports'] and
+                    iface in rule['interfaces']):
+                    count = conn_data['count']
+                    window = (conn_data['last_seen'] - conn_data['first_seen']).seconds
+                    if window > 0:
+                        rate = count / window
+                        if rate > rule[f'{proto}_rate']:
+                            self.stats['ddos_blocks'] += 1
+                            return ip, f"DDoS on {iface} ({count} conn/{window}s)"
+
+            return None, None
+
+        except Exception as e:
+            LOG.error(f"Error checking IP {ip}: {e}")
+            if DEBUG_MODE:
+                LOG.debug(traceback.format_exc())
+            return None, None
+
+    def get_stats(self):
+        """Return current monitoring statistics."""
+        return dict(self.stats)
+
+async def process_connections(self, proto):
+    """Process connections for a specific protocol."""
+    try:
+        cmd = ['ss', '-nt' if proto == 'tcp' else '-nu']
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            LOG.error(f"Failed to get {proto} connections: {stderr.decode()}")
+            return None, None
+
+        connections = stdout.decode().splitlines()[1:]  # Skip header
+        for conn in connections:
+            try:
+                fields = conn.split()
+                if len(fields) >= 5:
+                    src_ip = fields[4].split(':')[0].strip('[]')
+                    dst_port = int(fields[4].split(':')[1])
+                    iface = fields[3] if len(fields) > 3 else 'any'
+
+                    # Process the connection
+                    should_block, reason = await self.check_ip(
+                        src_ip, iface, proto, dst_port
+                    )
+                    if should_block:
+                        return src_ip, reason
+
+                    # Track rate per interface
+                    self.track_rate(proto, iface, src_ip)
+
+            except (IndexError, ValueError) as e:
+                LOG.debug(f"Error parsing connection: {e}")
+                continue
+
+        return None, None
+
+    except Exception as e:
+        LOG.error(f"Error processing {proto} connections: {e}")
+        if DEBUG_MODE:
+            LOG.debug(traceback.format_exc())
+        return None, None
+
+def track_rate(self, proto, iface, ip):
+    """Track connection rates for DDoS detection."""
+    now = datetime.now()
+    conn_data = self.connections[proto][iface][ip]
+
+    # Update connection tracking
+    if 'first_seen' not in conn_data:
+        conn_data['first_seen'] = now
+        conn_data['count'] = 0
+        conn_data['burst_start'] = now
+        conn_data['burst_count'] = 0
+
+    conn_data['count'] += 1
+    conn_data['last_seen'] = now
+
+    # Track burst rate
+    if (now - conn_data['burst_start']).total_seconds() <= 1:
+        conn_data['burst_count'] += 1
+    else:
+        conn_data['burst_start'] = now
+        conn_data['burst_count'] = 1
+
+    # Update stats
+    self.stats[f'{proto}_total'] += 1
+    self.stats[f'{proto}_{iface}_total'] += 1
+
+async def monitor_loop(self):
+    """Main monitoring loop."""
+    while True:
+        try:
+            self.cleanup()
+
+            # Check TCP connections
+            ip, reason = await self.process_connections('tcp')
+            if ip:
+                await block_ip(ip, reason)
+                self.blocked.add(ip)
+
+            # Check UDP connections
+            ip, reason = await self.process_connections('udp')
+            if ip:
+                await block_ip(ip, reason)
+                self.blocked.add(ip)
+
+            # Update stats
+            self.stats['monitoring_cycles'] += 1
+
+        except Exception as e:
+            LOG.error(f"Error in monitor loop: {e}")
+            if DEBUG_MODE:
+                LOG.debug(traceback.format_exc())
+
+        await asyncio.sleep(self.config.get('check_interval', 5))
+
+
+async def monitor_connections():
+    """Main monitoring loop with stats tracking."""
+    tracker = ConnectionTracker(CONFIG)
+    stats = ConnectionStats()
+    interval = CONFIG.get('check_interval', 5)
+    last_stats_report = datetime.now()
+    stats_interval = 300  # Report stats every 5 minutes
+
+    while True:
+        try:
+            # Cleanup old entries
+            tracker.cleanup()
+
+            # Process active connections
+            tcp_stats = await asyncio.create_subprocess_exec(
+                'ss', '-nt',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await tcp_stats.communicate()
+
+            if tcp_stats.returncode == 0:
+                connections = stdout.decode().splitlines()[1:]
+                for conn in connections:
+                    try:
+                        fields = conn.split()
+                        if len(fields) >= 5:
+                            src_ip = fields[4].split(':')[0].strip('[]')
+                            dst_port = int(fields[4].split(':')[1])
+                            iface = fields[3] if len(fields) > 3 else 'any'
+                            stats.update_connection('tcp', iface, src_ip)
+                            if src_ip not in tracker.blocked:
+                                should_block, reason = await tracker.check_ip(
+                                    src_ip, iface, 'tcp', dst_port, direction='inbound'
+                                )
+                                if should_block:
+                                    await block_ip(src_ip, reason, direction='inbound')
+                                    tracker.blocked.add(src_ip)
+                                    stats.record_block(src_ip, reason, 'tcp')
+                    except (IndexError, ValueError) as e:
+                        LOG.debug(f"Error parsing connection: {e}")
+
+            # Process UDP connections similarly
+            udp_stats = await asyncio.create_subprocess_exec(
+                'ss', '-nu',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await udp_stats.communicate()
+
+            if udp_stats.returncode == 0:
+                connections = stdout.decode().splitlines()[1:]
+                for conn in connections:
+                    try:
+                        fields = conn.split()
+                        if len(fields) >= 5:
+                            src_ip = fields[4].split(':')[0].strip('[]')
+                            dst_port = int(fields[4].split(':')[1])
+                            iface = fields[3] if len(fields) > 3 else 'any'
+                            stats.update_connection('udp', iface, src_ip)
+                            if src_ip not in tracker.blocked:
+                                should_block, reason = await tracker.check_ip(
+                                    src_ip, iface, 'udp', dst_port, direction='inbound'
+                                )
+                                if should_block:
+                                    await block_ip(src_ip, reason, direction='inbound')
+                                    tracker.blocked.add(src_ip)
+                                    stats.record_block(src_ip, reason, 'udp')
+                    except (IndexError, ValueError) as e:
+                        LOG.debug(f"Error parsing connection: {e}")
+
+            # Process domain blacklist
+            for domain in CONFIG.get('blacklist', {}).get('domains', []):
+                direction = CONFIG.get('blacklist', {}).get('direction', 'inbound')
+                if domain not in ipv6_failed_domains:
+                    addrs = await resolve_domain(domain)
+                    for addr in addrs:
+                        if addr not in tracker.blocked and addr not in CONFIG.get('whitelist', {}).get('ips', []):
+                            await block_ip(addr, f'blacklisted domain: {domain}', direction=direction)
+                            tracker.blocked.add(addr)
+                            stats.record_block(addr, f'blacklisted domain: {domain}', 'domain')
+
+            # Log stats periodically
+            if (datetime.now() - last_stats_report).total_seconds() > stats_interval:
+                stats_report = stats.get_report()
+                LOG.info("\n=== Statistics ===")
+                LOG.info(f"Uptime: {stats_report['uptime_seconds']} seconds")
+                LOG.info("\nConnections:")
+                for proto, counts in stats_report['connections'].items():
+                    LOG.info(f"  {proto.upper()}: {counts}")
+                LOG.info("\nBlocks:")
+                for reason, counts in stats_report['blocks'].items():
+                    LOG.info(f"  {reason}: {counts}")
+                last_stats_report = datetime.now()
+
+        except asyncio.CancelledError:
+            LOG.info("Monitor task cancelled")
+            break
+        except Exception as e:
+            LOG.error(f"Monitor error: {e}")
+            if DEBUG_MODE:
+                LOG.debug(traceback.format_exc())
+
+        await asyncio.sleep(interval)
+
+
+async def shutdown(loop):
+    """Handle clean shutdown."""
+    LOG.info("Shutting down...")
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    # Cancel all tasks
+    for task in tasks:
+        task.cancel()
+
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        cleanup()
+        loop.stop()
+
+async def resolve_domain(domain):
+    """Resolve domain to IPv4/IPv6 addresses."""
+    results = set()
+    try:
+        resolver = aiodns.DNSResolver()
+
+        # Try IPv4
+        try:
+            resp = await resolver.query(domain, 'A')
+            results.update(r.host for r in resp)
+        except Exception as e:
+            LOG.debug(f"IPv4 lookup failed for {domain}: {e}")
+
+        # Try IPv6 only if not already marked as failed
+        if domain not in ipv6_failed_domains:
+            try:
+                resp = await resolver.query(domain, 'AAAA')
+                results.update(r.host for r in resp)
+            except Exception as e:
+                LOG.debug(f"IPv6 lookup failed for {domain}: {e}")
+                ipv6_failed_domains.add(domain)
+
+    except Exception as e:
+        LOG.error(f"Failed to resolve {domain}: {e}")
+
+    # Cache results
+    dns_cache.set(domain, results)
+    return results
+
+def show_status():
+    """Show current blocking status and stats."""
+    # Show active sets
+    for set_name in ['blockmon4', 'blockmon6']:
+        output = run_nft(['list', 'set', 'inet', 'filter', set_name], capture_output=True)
+        if output:
+            LOG.info(f"\n=== {set_name} ===\n{output}")
+        else:
+            LOG.info(f"{set_name} not found or empty")
+
+    # Show DDoS sets
+    for set_name in ['ddos_tcp4', 'ddos_tcp6', 'ddos_udp4', 'ddos_udp6']:
+        output = run_nft(['list', 'set', 'inet', 'filter', set_name], capture_output=True)
+        if output:
+            LOG.info(f"\n=== {set_name} ===\n{output}")
+
+    # If using ConnectionTracker stats
+    if hasattr(ConnectionTracker, 'stats'):
+        stats_report = ConnectionTracker.stats.get_report()
+        LOG.info("\n=== Statistics ===")
+        LOG.info(f"Uptime: {stats_report['uptime_seconds']} seconds")
+        LOG.info("\nConnections:")
+        for proto, counts in stats_report['connections'].items():
+            LOG.info(f"  {proto.upper()}: {counts}")
+        LOG.info("\nBlocks:")
+        for reason, reason_counts in stats_report['blocks'].items():
+            LOG.info(f"  {reason}: {reason_counts}")
+        LOG.info("\nPeak Rates (connections/second):")
+        for proto, rates in stats_report['peak_rates'].items():
+            LOG.info(f"  {proto.upper()}: {rates}")
+
+def main():
+    """Main entry point with async handling."""
+    global CONFIG, LOG, DEBUG_MODE
+
+    args = parse_args()
+    if args.helpme:
+        print("Usage: nft-blockmon [--install|--uninstall|--status|--debug|--helpme]")
+        sys.exit(0)
+
+    try:
+        CONFIG = load_config(CONFIG_PATH)
+        DEBUG_MODE = args.debug or CONFIG.get('debug', False)
+        LOG = setup_logging()
+    except Exception as e:
+        print(f"Failed to load config: {e}")
+        sys.exit(1)
+
+    if args.status:
+        show_status()
+        return
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(loop)))
+
+    try:
+        ensure_table()
+        ensure_chains()
+        ensure_blockmon_sets()
+        add_base_rules()
+
+        LOG.info("Starting nft-blockmon...")
+        loop.run_until_complete(monitor_connections())
+
+    except Exception as e:
+        LOG.error(f"Fatal error: {e}")
+        if DEBUG_MODE:
+            LOG.debug(traceback.format_exc())
+    finally:
+        cleanup()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+if __name__ == "__main__":
+    main()
+
+END_PYTHON
+
